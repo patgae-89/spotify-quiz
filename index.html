@@ -209,6 +209,10 @@ table.board .sc{font-weight:700}
 .opt .cnt{margin-left:auto;font-size:13px;color:var(--muted);font-weight:500}
 .opt.cov .cnt{position:absolute;right:8px;top:8px;background:rgba(0,0,0,.65);padding:2px 8px;border-radius:8px;color:#fff}
 .tv .ask{font-size:30px}
+.teambox{border-left:5px solid var(--tc);padding:6px 0 6px 12px;margin-bottom:10px}
+.teambox .tname{font-weight:700;margin-bottom:6px;color:var(--tc)}
+.teampick{width:100%;border:1px solid transparent;text-align:left}
+.teampick.on{border-color:var(--ok);background:rgba(53,217,138,.1)}
 .count{font-size:76px;font-weight:700;line-height:64px;height:64px;margin:22px auto 16px;background:linear-gradient(135deg,var(--pink),var(--orange));-webkit-background-clip:text;background-clip:text;color:transparent;animation:pop 1s ease-out}
 @keyframes pop{0%{transform:scale(1.6);opacity:0}25%{transform:scale(1);opacity:1}}
 .standings{display:grid;grid-template-columns:minmax(0,1fr);gap:6px}
@@ -813,7 +817,7 @@ async function startGame(mp = false) {
     console.error(e);
     G = null;
     state.view = mp ? 'lobby' : 'home'; render();
-    if (mp) MP.broadcast(() => mpLobbyMsg());
+    if (mp) MP.broadcast(p => mpLobbyMsg(p));
     toast(e.message || String(e), 6000);
   }
 }
@@ -832,8 +836,9 @@ function onSnippetEnd() {
 }
 async function playSnippet() {
   const c = G?.cur; if (!c || G.phase === 'starting' || G.phase === 'countdown') return;
+  if (c.plays >= MAX_PLAYS) return toast('Du kannst jeden Ausschnitt höchstens 2× wiederholen.');
   Preview.unlock(); Out.activate();
-  if (!c.plays && !c.answered) { // kurzer Countdown vor dem ersten Abspielen der Runde
+  if (!c.plays && !c.answered && G.i === 0) { // kurzer Countdown nur vor dem ersten Song
     const g = G;
     G.phase = 'countdown';
     if (G.mp) MP.broadcast({ t: 'countdown', i: G.i, n: 3 });
@@ -853,6 +858,23 @@ async function playSnippet() {
     toast(e.message || 'Wiedergabe fehlgeschlagen.', 6000);
     if (G?.cur === c) { G.phase = c.answered ? 'answered' : (c.startedAt ? 'listened' : 'ready'); renderGame(); }
   }
+}
+const MAX_PLAYS = 3; // 1× abspielen + max. 2 Wiederholungen
+function replayCtrl(c) {
+  const left = MAX_PLAYS - c.plays;
+  return left > 0 ? `<button class="btn" data-act="play">↻ Nochmal hören <span class="muted small">(${left}× übrig)</span></button>` : `<div class="small muted">Keine Wiederholung mehr übrig</div>`;
+}
+// Kurzer Signalton (z. B. wenn jemand eine Antwort drückt)
+function blip(high = false) {
+  try {
+    const ctx = Preview.getCtx(); if (ctx.state !== 'running') ctx.resume();
+    const t = ctx.currentTime, o = ctx.createOscillator(), g = ctx.createGain();
+    const f = high ? 1175 : 880;
+    o.type = 'triangle'; o.frequency.setValueAtTime(f, t); o.frequency.exponentialRampToValueAtTime(f * 1.5, t + 0.07);
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.35 * Math.max(0.25, S.volume), t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    o.connect(g); g.connect(ctx.destination); o.start(t); o.stop(t + 0.25);
+  } catch { }
 }
 function checkText(c, text) {
   return c.qType === 'artist' ? c.track.artists.some(a => isMatch(text, a)) : isMatch(text, correctLabel(c.track, c.qType));
@@ -878,6 +900,7 @@ function submitAnswer(idx, text) {
     pts = calcPts(c, elapsed, G.streak);
   } else G.streak = 0;
   c.ok = ok; c.pts = pts; G.score += pts;
+  blip();
   G.log.push({ name: c.track.name, artist: c.track.artists.join(', '), cover: c.track.coverSmall, ok, pts, q: c.qType, fx: c.fx });
   stopPlayback();
   G.phase = 'answered';
@@ -915,7 +938,7 @@ function quitGame() {
   const wasMp = G?.mp;
   if (wasMp) clearTimeout(G.cur?.timer);
   G = null;
-  if (wasMp) { state.view = 'lobby'; render(); MP.broadcast(() => mpLobbyMsg()); }
+  if (wasMp) { state.view = 'lobby'; render(); MP.broadcast(p => mpLobbyMsg(p)); }
   else { state.view = 'home'; render(); }
 }
 
@@ -1131,7 +1154,7 @@ function gameHtml() {
   else if (G.phase === 'starting') { ctrl = `<button class="playbtn spin" aria-label="Lädt">${ICON_PLAY}</button>`; hint = 'Startet …'; }
   else if (G.phase === 'countdown') { ctrl = ''; hint = 'Gleich geht’s los …'; }
   else if (playing) { ctrl = ''; hint = ''; }
-  else { ctrl = `<button class="btn" data-act="play">↻ Nochmal hören</button>`; hint = c.answered ? '' : 'Die Zeit läuft – Punkte gibt’s auch für Tempo.'; }
+  else { ctrl = replayCtrl(c); hint = c.answered ? '' : 'Die Zeit läuft – Punkte gibt’s auch für Tempo.'; }
   const stage = `<div class="card stage">
       <span class="fx fx-${c.fx}">${fx.icon} ${fx.label}</span>
       <div class="ask">${q.ask}</div>
@@ -1237,7 +1260,7 @@ function peerErrMsg(err) {
 async function keepAwake() { try { if (navigator.wakeLock && !keepAwake.lock) { keepAwake.lock = await navigator.wakeLock.request('screen'); keepAwake.lock.addEventListener('release', () => { keepAwake.lock = null; }); } } catch { } }
 
 const MP = {
-  peer: null, code: null, status: 'idle', error: '', players: new Map(), conns: new Map(),
+  peer: null, code: null, status: 'idle', error: '', players: new Map(), conns: new Map(), teams: new Map(), teamSeq: 0,
   async open() {
     if (this.peer && this.status === 'ready') return;
     this.status = 'connecting'; this.error = '';
@@ -1266,7 +1289,7 @@ const MP = {
   close() {
     for (const c of this.conns.values()) { try { c.send({ t: 'closed' }); } catch { } setTimeout(() => { try { c.close(); } catch { } }, 300); }
     const p = this.peer; setTimeout(() => { try { p?.destroy(); } catch { } }, 400);
-    this.peer = null; this.status = 'idle'; this.code = null; this.players.clear(); this.conns.clear();
+    this.peer = null; this.status = 'idle'; this.code = null; this.players.clear(); this.conns.clear(); this.teams.clear();
   },
   onConn(conn) {
     conn.on('data', m => { try { this.onMsg(conn, m); } catch (e) { console.error(e); } });
@@ -1291,7 +1314,7 @@ const MP = {
         if (this.players.size >= 40) { try { conn.send({ t: 'full' }); } catch { } return; }
         const taken = new Set([...this.players.values()].map(x => x.name.toLowerCase()));
         let n = name, k = 2; while (taken.has(n.toLowerCase())) n = name + ' ' + (k++);
-        p = { pid, name: n, score: 0, streak: 0, best: 0, correct: 0, played: false, online: true };
+        p = { pid, name: n, score: 0, streak: 0, best: 0, correct: 0, played: false, online: true, team: null };
         this.players.set(pid, p);
       }
       const old = this.conns.get(pid); if (old && old !== conn) { try { old.close(); } catch { } }
@@ -1304,13 +1327,52 @@ const MP = {
     let pid = null; for (const [id, c] of this.conns) if (c === conn) pid = id;
     if (!pid) return;
     if (m.t === 'answer') mpAnswer(pid, m);
+    if (m.t === 'team') mpTeamAction(pid, m);
   }
 };
 
 const mpOnline = () => [...MP.players.values()].filter(p => p.online);
 const mpRanking = () => [...MP.players.values()].sort((a, b) => b.score - a.score);
-function mpRankOf(p) { const r = mpRanking(); return { rank: r.findIndex(x => x.pid === p.pid) + 1, of: r.length }; }
-const mpLobbyMsg = () => ({ t: 'lobby', players: mpOnline().map(p => p.name) });
+function mpRankOf(p) { const r = mpRanking(); return { rank: 1 + r.filter(x => x.score > p.score).length, of: r.length }; } // Gleichstand = gleicher Platz
+const TEAM_COLORS = ['#ff3d81', '#3de0ff', '#c8ff4d', '#ff8a3d', '#9e8bff', '#35d98a', '#ffd23d', '#ff5a5a'];
+function mpTeamList() { // Teams mit Mitgliedern, sortiert nach Ø-Punkten
+  return [...MP.teams.values()].map(t => {
+    const members = [...MP.players.values()].filter(p => p.team === t.id);
+    const total = members.reduce((s, p) => s + p.score, 0);
+    return { ...t, members, total, avg: members.length ? Math.round(total / members.length) : 0 };
+  }).filter(t => t.members.length).sort((a, b) => b.avg - a.avg);
+}
+function mpCleanTeams() { for (const id of [...MP.teams.keys()]) if (![...MP.players.values()].some(p => p.team === id)) MP.teams.delete(id); }
+function mpTeamAction(pid, m) {
+  const p = MP.players.get(pid); if (!p) return;
+  if (G?.mp) return MP.send(pid, { t: 'toast', msg: 'Teams können nur in der Lobby geändert werden.' });
+  if (m.action === 'create') {
+    const name = String(m.name || '').replace(/\s+/g, ' ').trim().slice(0, 20);
+    if (!name) return;
+    const exists = [...MP.teams.values()].find(t => t.name.toLowerCase() === name.toLowerCase());
+    if (exists) p.team = exists.id;
+    else {
+      if (MP.teams.size >= 8) return MP.send(pid, { t: 'toast', msg: 'Es gibt schon 8 Teams – tritt einem bei.' });
+      const id = 't' + (++MP.teamSeq);
+      MP.teams.set(id, { id, name, color: TEAM_COLORS[(MP.teamSeq - 1) % TEAM_COLORS.length] });
+      p.team = id;
+    }
+  } else if (m.action === 'join' && MP.teams.has(m.id)) p.team = m.id;
+  else if (m.action === 'leave') p.team = null;
+  mpCleanTeams();
+  mpRefresh();
+}
+function mpTeamOf(p) { const t = p && p.team && MP.teams.get(p.team); return t ? { id: t.id, name: t.name, color: t.color } : null; }
+function mpTeamRank(p) {
+  const list = mpTeamList(); const i = list.findIndex(t => t.id === p.team);
+  return i < 0 ? null : { name: list[i].name, color: list[i].color, rank: 1 + list.filter(t => t.avg > list[i].avg).length, of: list.length, avg: list[i].avg };
+}
+const mpLobbyMsg = p => ({
+  t: 'lobby',
+  players: mpOnline().filter(x => !x.team).map(x => x.name),
+  teams: mpTeamList().map(t => ({ id: t.id, name: t.name, color: t.color, members: t.members.map(x => x.name) })),
+  team: p?.team || null
+});
 const mpTrackInfo = t => ({ name: t.name, artists: t.artists.join(', '), album: t.album, cover: t.coverSmall || t.cover });
 function mpRoundMsg(p) {
   const c = G.cur;
@@ -1327,25 +1389,31 @@ function mpRevealMsg(p) {
     t: 'reveal', i: G.i, last: G.i + 1 >= G.rounds,
     correct: c.opts ? c.opts.findIndex(o => o.ok) : -1,
     track: mpTrackInfo(c.track),
-    you: { ok: !!a?.ok, pts: a?.pts || 0, answered: !!a, given: a?.given ?? null, score: p.score, streak: p.streak, ...mpRankOf(p) }
+    you: { ok: !!a?.ok, pts: a?.pts || 0, answered: !!a, given: a?.given ?? null, score: p.score, streak: p.streak, ...mpRankOf(p), team: mpTeamRank(p) }
   };
 }
 function mpOverMsg(p) {
-  return { t: 'over', ranking: mpRanking().slice(0, 10).map(x => ({ name: x.name, score: x.score })), you: { ...mpRankOf(p), score: p.score, correct: p.correct, rounds: G.log.length } };
+  return {
+    t: 'over', ranking: mpRanking().slice(0, 10).map(x => ({ name: x.name, score: x.score })),
+    teams: mpTeamList().map(t => ({ name: t.name, color: t.color, avg: t.avg, n: t.members.length })),
+    you: { ...mpRankOf(p), score: p.score, correct: p.correct, rounds: G.log.length, team: mpTeamRank(p) }
+  };
 }
 function mpSnapshot(p) {
-  if (!G?.mp) return mpLobbyMsg();
+  if (!G?.mp) return mpLobbyMsg(p);
   if (G.phase === 'over') return mpOverMsg(p);
   const c = G.cur;
   if (!c) return { t: 'starting' };
   return c.answered ? mpRevealMsg(p) : mpRoundMsg(p);
 }
 function mpRefresh() {
-  if (state.view === 'lobby') {
-    const el = $('#lobbyPlayers'); if (el) el.innerHTML = lobbyPlayersHtml();
-    const b = $('#lobbyStart'); if (b) b.disabled = !mpOnline().length;
-    MP.broadcast(() => mpLobbyMsg());
-  } else if (state.view === 'game' && G?.mp) {
+  if (!G?.mp) {
+    if (state.view === 'lobby') {
+      const el = $('#lobbyPlayers'); if (el) el.innerHTML = lobbyPlayersHtml();
+      const b = $('#lobbyStart'); if (b) b.disabled = !mpOnline().length;
+    }
+    MP.broadcast(p => mpLobbyMsg(p));
+  } else if (state.view === 'game') {
     const el = $('#mpStatus'); if (el) el.innerHTML = mpChipsHtml();
   }
 }
@@ -1381,6 +1449,7 @@ function mpAnswer(pid, m) {
     c.mpAns[pid] = { ok, elapsed, given };
   }
   p.played = true;
+  blip(Object.keys(c.mpAns).length === 1); // erster Tipp etwas heller
   MP.send(pid, { t: 'got', i: G.i });
   mpRefresh();
   const online = mpOnline();
@@ -1429,8 +1498,16 @@ function ensureQr() {
 function lobbyPlayersHtml() {
   const ps = [...MP.players.values()];
   if (!ps.length) return '<div class="muted">Noch niemand da – scannt den QR-Code!</div>';
-  return `<div class="pchips">${ps.map(p => `<span class="pchip ${p.online ? '' : 'off'}">${p.online ? '🟢' : '⚪'} ${esc(p.name)}</span>`).join('')}</div>
-    <div class="small muted" style="margin-top:8px">${mpOnline().length} verbunden</div>`;
+  const chip = p => `<span class="pchip ${p.online ? '' : 'off'}">${p.online ? '🟢' : '⚪'} ${esc(p.name)}</span>`;
+  const teams = mpTeamList();
+  const solo = ps.filter(p => !p.team);
+  return teams.map(t => `<div class="teambox" style="--tc:${t.color}"><div class="tname">${esc(t.name)} <span class="muted small">· ${t.members.length}</span></div><div class="pchips">${t.members.map(chip).join('')}</div></div>`).join('')
+    + (solo.length ? `${teams.length ? '<div class="small muted" style="margin:10px 0 6px">Ohne Team</div>' : ''}<div class="pchips">${solo.map(chip).join('')}</div>` : '')
+    + `<div class="small muted" style="margin-top:8px">${mpOnline().length} verbunden${teams.length ? ' · ' + teams.length + ' Teams' : ' · Teams können die Mitspieler auf dem Handy erstellen'}</div>`;
+}
+function teamStandingsHtml() {
+  const teams = mpTeamList(); if (!teams.length) return '';
+  return `<div class="standings" style="margin-bottom:12px">${teams.map((t, i) => `<div class="srow" style="border-left:5px solid ${t.color}"><span class="rk">${i + 1}</span><span class="nm">${esc(t.name)}<div class="small muted" style="font-weight:400">${t.members.length} Spieler · gesamt ${t.total}</div></span><span class="sc">Ø ${t.avg}</span></div>`).join('')}</div>`;
 }
 function lobbyHtml() {
   let left;
@@ -1474,7 +1551,7 @@ function mpGameHtml() {
   if (G.phase === 'ready') { ctrl = `<button class="playbtn" data-act="play" aria-label="Snippet abspielen">${ICON_PLAY}</button>`; hint = 'Abspielen – dann dürfen alle auf dem Handy raten'; }
   else if (G.phase === 'starting') { ctrl = `<button class="playbtn spin" aria-label="Lädt">${ICON_PLAY}</button>`; hint = 'Startet …'; }
   else if (G.phase === 'countdown') hint = 'Gleich geht’s los …';
-  else if (!playing) ctrl = `<button class="btn" data-act="play">↻ Nochmal hören</button>`;
+  else if (!playing) ctrl = replayCtrl(c);
   const stage = `<div class="card stage">
       <span class="fx fx-${c.fx}">${fx.icon} ${fx.label}</span>
       <div class="ask">${q.ask}</div>
@@ -1503,7 +1580,7 @@ function mpGameHtml() {
         <div class="links"><button class="btn sm" data-act="listenNormal">▶ Original anhören</button></div></div></div>
       <div class="two" style="margin-top:14px">
         <div class="card" style="margin:0"><h2>Diese Runde</h2><div class="standings">${rows.map(({ p, a }) => `<div class="srow"><span class="nm">${esc(p.name)}<div class="small muted" style="font-weight:400;overflow:hidden;text-overflow:ellipsis">${a ? esc(a.given || '–') : 'keine Antwort'}</div></span><span class="gain ${a?.ok ? 'ok' : 'bad'}">${a?.ok ? '+' + a.pts : '✗'}</span></div>`).join('') || '<div class="muted">Niemand dabei.</div>'}</div></div>
-        <div class="card" style="margin:0"><h2>Gesamtstand</h2><div class="standings">${mpRanking().map((p, i) => `<div class="srow"><span class="rk">${i + 1}</span><span class="nm">${esc(p.name)}${p.streak >= 2 ? ' 🔥' + p.streak : ''}</span><span class="sc">${p.score}</span></div>`).join('')}</div></div>
+        <div class="card" style="margin:0"><h2>Gesamtstand</h2>${teamStandingsHtml()}<div class="standings">${mpRanking().map((p, i) => `<div class="srow"><span class="rk">${i + 1}</span><span class="nm">${esc(p.name)}${p.streak >= 2 ? ' 🔥' + p.streak : ''}</span><span class="sc">${p.score}</span></div>`).join('')}</div></div>
       </div>
       <div style="height:14px"></div>
       <button class="btn primary big" data-act="next">${last ? 'Endergebnis zeigen' : 'Nächste Runde →'}</button>`;
@@ -1512,16 +1589,19 @@ function mpGameHtml() {
 }
 function mpResultHtml() {
   const r = mpRanking();
-  const pod = [r[1], r[0], r[2]];
+  const teams = mpTeamList();
+  const useTeams = teams.length >= 2;
+  const items = useTeams ? teams.map(t => ({ name: t.name, score: 'Ø ' + t.avg })) : r.map(p => ({ name: p.name, score: p.score }));
+  const pod = [items[1], items[0], items[2]];
   const hgt = [80, 120, 60];
   return `<div class="wrap">${header()}
     <div class="card" style="text-align:center;padding:24px 16px">
       <div class="muted small">${esc(G.modeLabel)} · ${esc(G.plName)} · ${G.log.length} Runden</div>
-      <h1 style="margin-top:8px">🏆 ${r[0] ? esc(r[0].name) + ' gewinnt!' : 'Spiel vorbei'}</h1>
+      <h1 style="margin-top:8px">🏆 ${items[0] ? (useTeams ? 'Team ' : '') + esc(items[0].name) + ' gewinnt!' : 'Spiel vorbei'}</h1>
       <div class="podium">${pod.map((p, i) => p ? `<div class="pod"><div class="pn">${esc(p.name)}</div><div class="ps">${p.score} Pkt.</div><div class="blk" style="height:${hgt[i]}px">${['🥈', '🥇', '🥉'][i]}</div></div>` : '<div class="pod"></div>').join('')}</div>
     </div>
     <div class="two">
-      <div class="card"><h2>Rangliste</h2><div class="standings">${r.map((p, i) => `<div class="srow"><span class="rk">${i + 1}</span><span class="nm">${esc(p.name)}<div class="small muted" style="font-weight:400">${p.correct}/${G.log.length} richtig · beste Serie ${p.best}</div></span><span class="sc">${p.score}</span></div>`).join('')}</div></div>
+      <div class="card"><h2>Rangliste</h2>${teamStandingsHtml()}<div class="standings">${r.map((p, i) => `<div class="srow"><span class="rk">${i + 1}</span><span class="nm">${esc(p.name)}<div class="small muted" style="font-weight:400">${p.correct}/${G.log.length} richtig · beste Serie ${p.best}</div></span><span class="sc">${p.score}</span></div>`).join('')}</div></div>
       <div class="card"><h2>Die Songs</h2><div class="rounds">${G.log.map((x, i) => `<div class="rrow">${x.cover ? `<img src="${esc(x.cover)}" alt="">` : ''}<div class="m"><div>${i + 1}. ${esc(x.name)}</div><div class="s">${esc(x.artist)} · ${EFFECTS[x.fx].icon} ${EFFECTS[x.fx].label}</div></div><div class="p ${x.okN ? 'ok' : 'bad'}">${x.okN}/${x.total}</div></div>`).join('')}</div></div>
     </div>
     <div class="row" style="justify-content:center;margin-top:6px">
@@ -1574,7 +1654,7 @@ const PL = {
   onMsg(m) {
     switch (m?.t) {
       case 'welcome': this.name = m.name; this.score = m.score; if (this.st === 'connecting' || this.st === 'lost') this.st = 'lobby'; keepAwake(); break;
-      case 'lobby': this.players = m.players || []; this.st = 'lobby'; this.round = this.reveal = this.over = null; this.score = 0; break;
+      case 'lobby': this.players = m.players || []; this.teams = m.teams || []; this.team = m.team || null; this.st = 'lobby'; this.round = this.reveal = this.over = null; this.score = 0; break;
       case 'starting': this.st = 'starting'; this.score = 0; break;
       case 'round':
         this.round = m; this.reveal = null; this.given = m.given || ''; this.score = m.score || 0; this.countEnd = 0;
@@ -1586,6 +1666,7 @@ const PL = {
         break;
       case 'countdown': if (this.round && this.round.i === m.i) this.countEnd = Date.now() + m.n * 1000; break;
       case 'got': this.st = 'answered'; break;
+      case 'toast': toast(m.msg); return;
       case 'reveal': this.reveal = m; this.score = m.you.score; this.st = 'reveal'; try { navigator.vibrate?.(m.you.ok ? [40, 60, 40] : 200); } catch { } break;
       case 'over': this.over = m; this.score = m.you.score; this.st = 'over'; break;
       case 'closed': this.st = 'join'; this.err = 'Der Host hat die Lobby geschlossen.'; this.conn = null; break;
@@ -1594,10 +1675,12 @@ const PL = {
     }
     renderPlayer();
   },
+  send(m) { try { this.conn?.send(m); } catch { } },
   answer(idx, text) {
     if (this.st !== 'round' || !this.round?.open) return;
     this.given = text != null ? text : (this.round.opts?.[idx]?.label || '');
     try { this.conn?.send({ t: 'answer', i: this.round.i, idx, text }); } catch { }
+    blip();
     this.st = 'answered'; renderPlayer();
   }
 };
@@ -1621,9 +1704,18 @@ function playerHtml() {
     case 'connecting': return top + spin('Verbinde mit dem Spiel …') + `<div style="text-align:center"><button class="btn sm ghost" data-act="plCancel">Abbrechen</button></div>`;
     case 'lost': return top + spin('Verbindung unterbrochen – verbinde neu …');
     case 'starting': return top + spin('Gleich geht’s los … 🎧');
-    case 'lobby': return top + `<div class="card pl-center"><div class="check">✓</div><div class="pl-big">Du bist dabei!</div>
-        <p class="muted">Warte, bis der Host das Spiel startet.</p>
-        <div class="pchips" style="justify-content:center">${P.players.map(n => `<span class="pchip">${esc(n)}</span>`).join('')}</div></div>`;
+    case 'lobby': {
+      const my = (P.teams || []).find(t => t.id === P.team);
+      return top + `<div class="card pl-center" style="padding:22px 18px"><div class="check">✓</div><div class="pl-big" style="font-size:28px">Du bist dabei!</div>
+          <div>${my ? `Dein Team: <b style="color:${my.color}">${esc(my.name)}</b>` : '<span class="muted">Du spielst noch ohne Team.</span>'}</div>
+          <p class="muted small" style="margin-bottom:0">Warte, bis der Host das Spiel startet.</p></div>
+        <div class="card"><h2>Teams</h2>
+          ${(P.teams || []).length ? `<div class="standings">${P.teams.map(t => `<button class="srow teampick ${t.id === P.team ? 'on' : ''}" style="border-left:5px solid ${t.color}" data-act="plTeam" data-k="${esc(t.id)}"><span class="nm" style="text-align:left">${esc(t.name)}<div class="small muted" style="font-weight:400">${t.members.map(esc).join(', ')}</div></span><span class="small">${t.id === P.team ? '✓ Dein Team' : 'Beitreten'}</span></button>`).join('')}</div>` : '<p class="muted small" style="margin-top:0">Noch keine Teams. Erstelle das erste!</p>'}
+          <form class="free" id="plTeamForm" style="margin-top:12px"><input class="field" id="plTeamName" placeholder="Neues Team, z. B. Die Ohrwürmer" maxlength="20" autocomplete="off"><button class="btn" type="submit">Erstellen</button></form>
+          ${P.team ? `<button class="btn sm ghost" style="margin-top:10px" data-act="plTeamLeave">Ohne Team spielen</button>` : ''}
+          ${P.players.length ? `<div class="lbl">Ohne Team</div><div class="pchips">${P.players.map(n => `<span class="pchip">${esc(n)}</span>`).join('')}</div>` : ''}
+        </div>`;
+    }
     case 'round':
     case 'answered': {
       const r = P.round; if (!r) return top + spin('Warte …');
@@ -1650,6 +1742,7 @@ function playerHtml() {
           ${!y.ok && y.given ? `<div class="muted small">Deine Antwort: ${esc(y.given)}</div>` : ''}
           <div class="reveal" style="text-align:left;margin-top:16px">${t.cover ? `<img src="${esc(t.cover)}" alt="" style="width:76px;height:76px">` : ''}<div style="min-width:0"><div class="t" style="font-size:18px">${esc(t.name)}</div><div class="a">${esc(t.artists)}</div><div class="al">${esc(t.album)}</div></div></div>
           <p><b>${y.score}</b> Punkte · Platz <b>${y.rank}</b> von ${y.of}${y.streak >= 2 ? ' · 🔥 ' + y.streak + 'er-Serie' : ''}</p>
+          ${y.team ? `<p class="small">Team <b style="color:${y.team.color}">${esc(y.team.name)}</b>: Platz ${y.team.rank} von ${y.team.of} (Ø ${y.team.avg})</p>` : ''}
           <p class="small muted" style="margin:0">${v.last ? 'Gleich kommt das Endergebnis …' : 'Der Host startet gleich die nächste Runde …'}</p></div>`;
     }
     case 'over': {
@@ -1657,7 +1750,9 @@ function playerHtml() {
       return top + `<div class="card pl-center">
           <div class="muted">Endergebnis</div>
           <div class="score-big" style="margin:8px 0">Platz ${y.rank}</div>
-          <div><b>${y.score}</b> Punkte · ${y.correct}/${y.rounds} richtig</div></div>
+          <div><b>${y.score}</b> Punkte · ${y.correct}/${y.rounds} richtig</div>
+          ${y.team ? `<div class="small" style="margin-top:6px">Team <b style="color:${y.team.color}">${esc(y.team.name)}</b>: Platz ${y.team.rank} von ${y.team.of}</div>` : ''}</div>
+        ${(o.teams || []).length ? `<div class="card"><h2>Teams</h2><div class="standings">${o.teams.map((t, i) => `<div class="srow" style="border-left:5px solid ${t.color}"><span class="rk">${i + 1}</span><span class="nm">${esc(t.name)}</span><span class="sc">Ø ${t.avg}</span></div>`).join('')}</div></div>` : ''}
         <div class="card"><h2>Rangliste</h2><div class="standings">${o.ranking.map((x, i) => `<div class="srow"><span class="rk">${i + 1}</span><span class="nm">${esc(x.name)}</span><span class="sc">${x.score}</span></div>`).join('')}</div>
         <p class="small muted" style="margin-bottom:0">Bleib hier – wenn der Host nochmal startet, bist du automatisch dabei.</p></div>`;
     }
@@ -1667,12 +1762,13 @@ function playerHtml() {
 function renderPlayer() {
   if (state.view !== 'player') return;
   const root = $('#plRoot'); if (!root) return render();
-  const val = $('#plFreeIn')?.value || '';
-  const code = $('#plCode')?.value, name = $('#plName')?.value;
+  const vals = {}; root.querySelectorAll('input[id]').forEach(i => { vals[i.id] = i.value; });
+  const focusId = document.activeElement?.id;
   root.innerHTML = playerHtml();
-  const fi = $('#plFreeIn'); if (fi) { fi.value = val; if (!fi.disabled) fi.focus({ preventScroll: true }); }
-  if (code != null && $('#plCode')) $('#plCode').value = code;
-  if (name != null && $('#plName')) $('#plName').value = name;
+  for (const [id, v] of Object.entries(vals)) { const i = $('#' + id); if (i) i.value = v; }
+  const fi = $('#plFreeIn');
+  const f = (focusId && $('#' + focusId)) || (fi && !fi.disabled ? fi : null);
+  if (f && f.tagName === 'INPUT') f.focus({ preventScroll: true });
 }
 setInterval(() => {
   const t = $('#mpTimer'); if (t && G?.cur?.open) t.textContent = Math.max(0, Math.ceil((G.cur.deadline - Date.now()) / 1000)) + ' s';
@@ -1728,13 +1824,13 @@ const actions = {
     if (S.output === 'browser' && !isMobile() && Out.status === 'idle') Out.initBrowser().catch(() => { });
     loadTracks(S.playlist).catch(() => { });
     if (MP.status !== 'ready') { try { await MP.open(); } catch { } if (state.view === 'lobby') render(); }
-    else MP.broadcast(() => mpLobbyMsg());
+    else MP.broadcast(p => mpLobbyMsg(p));
     ensureQr();
   },
   closeLobby() { MP.close(); G = null; state.view = 'home'; render(); },
   mpStart() { startGame(true); },
   mpRevealNow() { mpReveal(); },
-  mpLobby() { G = null; state.view = 'lobby'; render(); ensureQr(); MP.broadcast(() => mpLobbyMsg()); },
+  mpLobby() { G = null; state.view = 'lobby'; render(); ensureQr(); MP.broadcast(p => mpLobbyMsg(p)); },
   plJoin() {
     const code = ($('#plCode')?.value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 5);
     const name = ($('#plName')?.value || '').replace(/\s+/g, ' ').trim().slice(0, 20);
@@ -1747,6 +1843,8 @@ const actions = {
   },
   plCancel() { const c = PL.conn; PL.conn = null; PL.st = 'join'; try { c?.close(); } catch { } renderPlayer(); },
   plAns(el) { PL.answer(+el.dataset.k); },
+  plTeam(el) { if (el.dataset.k !== PL.team) PL.send({ t: 'team', action: 'join', id: el.dataset.k }); },
+  plTeamLeave() { PL.send({ t: 'team', action: 'leave' }); },
   clearBoard() {
     if (!state.confirmClear) { state.confirmClear = true; render(); return; }
     store.set('board', []); state.confirmClear = false; render(); toast('Bestenliste geleert.');
@@ -1762,6 +1860,7 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('submit', e => {
   if (e.target.id === 'freeForm') { e.preventDefault(); const v = ($('#freeIn')?.value || '').trim(); if (v) submitAnswer(null, v); }
+  if (e.target.id === 'plTeamForm') { e.preventDefault(); const v = ($('#plTeamName')?.value || '').trim(); if (v) { PL.send({ t: 'team', action: 'create', name: v }); $('#plTeamName').value = ''; $('#plTeamName').blur(); } }
   if (e.target.id === 'plFree') { e.preventDefault(); const v = ($('#plFreeIn')?.value || '').trim(); if (v) PL.answer(null, v); }
 });
 document.addEventListener('input', e => {
